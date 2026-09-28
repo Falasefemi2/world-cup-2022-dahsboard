@@ -1,0 +1,263 @@
+package ui
+
+import (
+	"fmt"
+	"time"
+
+	"charm.land/bubbles/v2/help"
+	"charm.land/bubbles/v2/key"
+	"charm.land/bubbles/v2/spinner"
+	"charm.land/lipgloss/v2"
+	"github.com/Falasefemi2/worldcupdashboard/data"
+	"github.com/Falasefemi2/worldcupdashboard/ui/bigtext"
+	"github.com/Falasefemi2/worldcupdashboard/ui/bracket"
+	"github.com/Falasefemi2/worldcupdashboard/ui/group"
+	"github.com/Falasefemi2/worldcupdashboard/ui/match"
+	"github.com/Falasefemi2/worldcupdashboard/ui/nav"
+	"github.com/Falasefemi2/worldcupdashboard/ui/playerstats"
+	"github.com/Falasefemi2/worldcupdashboard/ui/statusbar"
+	tea "charm.land/bubbletea/v2"
+)
+
+type intervalRefreshMsg time.Time
+
+const refreshInterval = time.Duration(1) * time.Minute
+
+type dashboard struct {
+	bigtext             *bigtext.BigText
+	dataFetcher         dataFetcher
+	dataFetchErr        error
+	dataFetchLastUpdate time.Time
+	dataFetchLoading    bool
+	dataFetchSpinner    spinner.Model
+	help                help.Model
+	playerStatsByTeam   map[string]playerstats.PlayerStats
+	groupTablesByLetter map[string]data.GroupTable
+	sortedMatches       []data.Match
+	matchIndex          int
+	matchIndexChanged   bool
+	width, height       int
+}
+
+func NewDashboard(fetcher dataFetcher) tea.Model {
+	s := spinner.New()
+	s.Spinner = spinner.Globe
+
+	return &dashboard{
+		bigtext: bigtext.NewBigText(),
+
+		dataFetcher:      fetcher,
+		dataFetchLoading: true,
+		dataFetchSpinner: s,
+
+		help: help.New(),
+	}
+}
+
+func (m *dashboard) Init() tea.Cmd {
+	return tea.Batch(
+		func() tea.Msg { return m.dataFetchSpinner.Tick() },
+		dataFetchCmd(m.dataFetcher),
+	)
+}
+
+func (m *dashboard) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case dataFetchErrMsg:
+		m.dataFetchErr = msg.err
+		m.dataFetchLoading = false
+		return m, refreshCmd()
+
+	case dataFetchMsg:
+		m.dataFetchLoading = false
+		m.dataFetchLastUpdate = time.Now()
+		m.groupTablesByLetter = msg.groupTablesByLetter
+		m.sortedMatches = msg.sortedMatches
+		m.playerStatsByTeam = msg.playerStatsByTeam
+		if !m.matchIndexChanged || m.matchIndex > len(msg.sortedMatches)-1 {
+			m.matchIndex = pickMatchIndex(msg.sortedMatches)
+		}
+		m.dataFetchErr = nil
+		return m, refreshCmd()
+
+	case intervalRefreshMsg:
+		m.dataFetchLoading = true
+		return m, dataFetchCmd(m.dataFetcher)
+
+	case tea.KeyMsg:
+		switch keypress := msg.String(); keypress {
+		case "q", "ctrl+c", "esc":
+			return m, tea.Quit
+		case "right", " ", "d", "l":
+			if len(m.sortedMatches) == 0 {
+				return m, nil
+			}
+
+			m.matchIndexChanged = true
+			m.matchIndex = min(m.matchIndex+1, len(m.sortedMatches)-1)
+			return m, nil
+		case "left", "a", "h":
+			if len(m.sortedMatches) == 0 {
+				return m, nil
+			}
+
+			m.matchIndexChanged = true
+			m.matchIndex = max(m.matchIndex-1, 0)
+			return m, nil
+		}
+
+	case spinner.TickMsg:
+		var cmd tea.Cmd
+		m.dataFetchSpinner, cmd = m.dataFetchSpinner.Update(msg)
+		return m, cmd
+
+	case tea.WindowSizeMsg:
+		m.width, m.height = msg.Width, msg.Height
+		m.help.SetWidth(msg.Width)
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m *dashboard) View() tea.View {
+	render := func(content string) tea.View {
+		v := tea.NewView(content)
+		v.AltScreen = true
+		return v
+	}
+
+	if m.width == 0 || m.height == 0 {
+		return render("Initializing...")
+	}
+
+	fullScreenMsgStyle := lipgloss.NewStyle().Width(m.width).Height(m.height).Align(lipgloss.Center, lipgloss.Center)
+
+	// Lowered for small terminals. Recommended (real) size: 160 cols x 50 rows.
+	minWidth := 100
+	minHeight := 30
+	if m.width < minWidth || m.height < minHeight {
+		return render(fullScreenMsgStyle.Render(fmt.Sprintf("❌ Need at least %d columns and %d rows to render.\n\nResize terminal or press q to quit.", minWidth, minHeight)))
+	}
+
+	if len(m.sortedMatches) == 0 {
+		if m.dataFetchLoading {
+			return render(fullScreenMsgStyle.Render(m.dataFetchSpinner.View() + " " + fmt.Sprintf("Loading data from %s...", m.dataFetcher.Name())))
+		}
+
+		if m.dataFetchErr != nil {
+			return render(fullScreenMsgStyle.Render(fmt.Sprintf("❌ HTTP request failed with err: %v.\n\nPress q to quit.", m.dataFetchErr.Error())))
+		}
+
+		return render(fullScreenMsgStyle.Render("❓ HTTP request succeeded but no matches available.\n\nPress q to quit."))
+	}
+
+	navContainer := lipgloss.NewStyle().
+		Border(lipgloss.NormalBorder(), false, false, true, false).
+		PaddingTop(1).
+		PaddingBottom(1).
+		SetString(nav.Nav(nav.NavParams{
+			Index:   m.matchIndex,
+			Matches: m.sortedMatches,
+			Width:   m.width,
+		})).
+		String()
+
+	groupOrBracketContainer := lipgloss.NewStyle().
+		Border(lipgloss.NormalBorder(), true, false, false, false).
+		PaddingTop(1).
+		Width(m.width).
+		Align(lipgloss.Center).
+		SetString(m.groupOrBracket()).
+		String()
+
+	statusBarContainer := lipgloss.NewStyle().
+		SetString(statusbar.StatusBar(statusbar.StatusBarParams{
+			API:        m.dataFetcher.Name(),
+			Err:        m.dataFetchErr,
+			LastUpdate: m.dataFetchLastUpdate,
+			Loading:    m.dataFetchLoading,
+			Spinner:    m.dataFetchSpinner,
+			Width:      m.width,
+		})).
+		String()
+
+	keyMap := keyMap{
+		Left:  key.NewBinding(key.WithKeys("left", "a", "h"), key.WithHelp("◄/a/h", "prev match")),
+		Right: key.NewBinding(key.WithKeys("right", "d", " ", "l"), key.WithHelp("►/d/l/space", "next match")),
+		Quit:  key.NewBinding(key.WithKeys("q", "ctrl+c"), key.WithHelp("q/ctrl+c", "quit")),
+	}
+	helpContainer := lipgloss.NewStyle().
+		SetString(m.help.View(keyMap)).
+		Width(m.width).
+		Align(lipgloss.Center).
+		PaddingTop(1).
+		String()
+
+	matchContainerHeight := m.height - lipgloss.Height(navContainer) - lipgloss.Height(groupOrBracketContainer) - lipgloss.Height(statusBarContainer) - lipgloss.Height(helpContainer)
+	matchContainer := lipgloss.NewStyle().
+		SetString(match.Match(match.MatchParams{
+			BigText:           m.bigtext,
+			PlayerStatsByTeam: m.playerStatsByTeam,
+			Match:             m.sortedMatches[min(m.matchIndex, len(m.sortedMatches)-1)],
+			Width:             m.width - 1 - 1,
+		})).
+		Height(matchContainerHeight).
+		MaxHeight(matchContainerHeight).
+		PaddingLeft(1).
+		PaddingRight(1).
+		String()
+
+	return render(navContainer + "\n" + matchContainer + "\n" + helpContainer + "\n" + groupOrBracketContainer + "\n" + statusBarContainer)
+}
+
+func (m *dashboard) groupOrBracket() string {
+	currentMatch := m.sortedMatches[min(m.matchIndex, len(m.sortedMatches)-1)]
+	if currentMatch.Stage == string(data.StageGroup) {
+		homeTeamInfo, ok := data.TeamInfoByCode[currentMatch.HomeTeamCode]
+		if !ok {
+			return "Group table not available.\n"
+		}
+
+		groupTable, ok := m.groupTablesByLetter[homeTeamInfo.Group]
+		if !ok {
+			return "Group table not available.\n"
+		}
+
+		return group.Group(groupTable)
+	}
+
+	return bracket.Bracket(m.sortedMatches)
+}
+
+func refreshCmd() tea.Cmd {
+	return tea.Tick(
+		refreshInterval,
+		func(t time.Time) tea.Msg {
+			return intervalRefreshMsg(t)
+		},
+	)
+}
+
+func pickMatchIndex(matches []data.Match) int {
+	for i, match := range matches {
+		if match.Status == data.StatusLive || match.Status == data.StatusScheduled {
+			return i
+		}
+	}
+
+	return len(matches) - 1
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
