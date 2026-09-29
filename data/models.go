@@ -9,7 +9,7 @@ const (
 	EventTypePenaltyKickGoal     = "Goal (P)"
 	EventTypePenaltyShootoutGoal = "Goal (S)"
 	EventTypeOwnGoal             = "Own Goal"
-	EventTypeYellowCard          = "Yello Card"
+	EventTypeYellowCard          = "Yellow Card"
 	EventTypeSeconYellowCard     = "Second Yellow Card"
 	EventTypeRedCard             = "Red Card"
 	EventTypeSubIn               = "Substitution In"
